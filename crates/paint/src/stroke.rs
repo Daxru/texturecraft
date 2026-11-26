@@ -142,6 +142,9 @@ impl Stroke {
         // A later screen sample resamples from this hit's screen position: give it the real one
         // (NaN when it does not project, so that sample starts a new run instead)
         let hit = SurfaceHit { screen: to_screen(ctx, hit.pos).unwrap_or(Vec2::NAN), ..hit };
+        // The lazy mouse follows the run too, so a later screen sample does not trail from
+        // where the last visible sample left it
+        self.lazy = hit.screen.is_finite().then_some(hit.screen);
         self.advance(ctx, hit, radius, &mut out, |p| nearest_surface(ctx.mesh, ctx.bvh, p, radius * 2.0), true);
         self.finish(ctx, out)
     }
@@ -372,6 +375,26 @@ mod tests {
         let stamps = s.add(&ctx, Vec2::new(300.0, 200.0), 1.0);
         assert!(!stamps.is_empty(), "the visible point is painted");
         assert!(stamps.iter().all(|st| st.center.y.abs() < 0.1), "every stamp stays on the row between the two points");
+    }
+
+    /// With the lazy mouse on, a screen sample after a hidden point trails from where that point
+    /// projects, not from the last visible sample (which would paint back across the model)
+    #[test]
+    fn the_lazy_mouse_follows_a_hidden_run() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let mut s = Stroke::new(&BrushSettings { size: 0.01, lazy: 100.0, ..BrushSettings::default() }, &m);
+        assert!(!s.add(&ctx, Vec2::new(300.0, 200.0), 1.0).is_empty(), "the first visible sample paints");
+        // The hidden far-side point projects to the view center
+        assert!(!s.add_surface(&ctx, far_side_hit(&m, &b, &c), 1.0).is_empty());
+        // Moving on to the left: nothing may be painted on the right of the center
+        let left = pick(&ctx, Vec2::new(120.0, 200.0)).unwrap().pos.x.signum();
+        let stamps = s.add(&ctx, Vec2::new(120.0, 200.0), 1.0);
+        assert!(
+            stamps.iter().all(|st| st.center.x * left > -0.05),
+            "a stamp trails back across the center: {:?}",
+            stamps.iter().map(|st| st.center).collect::<Vec<_>>()
+        );
     }
 
     /// A camera-aligned stamp on a surface the view cannot see faces that surface's side
