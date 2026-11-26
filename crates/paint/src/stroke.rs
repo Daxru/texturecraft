@@ -38,6 +38,12 @@ pub fn pick(ctx: &PickCtx, screen: Vec2) -> Option<SurfaceHit> {
     Some(SurfaceHit { pos: s.pos, nrm: s.nrm, tri: hit.tri, uv: s.uv, material: ctx.mesh.material_of(hit.tri as usize).unwrap_or(0), screen })
 }
 
+/// Viewport pixel of world point `p`, or None behind the camera
+fn to_screen(ctx: &PickCtx, p: Vec3) -> Option<Vec2> {
+    let aspect = ctx.viewport.x.max(1.0) / ctx.viewport.y.max(1.0);
+    ctx.camera.project(p, aspect).map(|ndc| Vec2::new((ndc.x * 0.5 + 0.5) * ctx.viewport.x, (0.5 - ndc.y * 0.5) * ctx.viewport.y))
+}
+
 /// The surface point nearest to `p` within `max_dist`, independent of any view (`screen` is zero)
 pub fn nearest_surface(mesh: &Mesh, bvh: &Bvh, p: Vec3, max_dist: f32) -> Option<SurfaceHit> {
     let hit = bvh.nearest(p, max_dist, &|_| true)?;
@@ -133,6 +139,9 @@ impl Stroke {
     pub fn add_surface(&mut self, ctx: &PickCtx, hit: SurfaceHit, pressure: f32) -> Vec<Stamp> {
         let mut out = Vec::new();
         let radius = self.radius_at(ctx, hit.pos, pressure);
+        // A later screen sample resamples from this hit's screen position: give it the real one
+        // (NaN when it does not project, so that sample starts a new run instead)
+        let hit = SurfaceHit { screen: to_screen(ctx, hit.pos).unwrap_or(Vec2::NAN), ..hit };
         self.advance(ctx, hit, radius, &mut out, |p| nearest_surface(ctx.mesh, ctx.bvh, p, radius * 2.0), true);
         self.finish(ctx, out)
     }
@@ -169,6 +178,11 @@ impl Stroke {
             return;
         };
         let radius = self.radius_at(ctx, hit.pos, pressure);
+        if self.last.is_some_and(|last| !last.screen.is_finite()) {
+            // The last point (on a surface the view cannot see) has no screen position to
+            // resample from: start a new run here
+            self.last = None;
+        }
         if let Some(last) = self.last {
             let len = hit.pos.distance(last.pos);
             if len > 4.0 * radius && depth < 4 {
@@ -189,12 +203,7 @@ impl Stroke {
             out,
             |p| {
                 // Snap to the surface by re-picking through the projected point.
-                let aspect = ctx.viewport.x.max(1.0) / ctx.viewport.y.max(1.0);
-                ctx.camera
-                    .project(p, aspect)
-                    .map(|ndc| Vec2::new((ndc.x * 0.5 + 0.5) * ctx.viewport.x, (0.5 - ndc.y * 0.5) * ctx.viewport.y))
-                    .and_then(|s| pick(ctx, s))
-                    .filter(|h| h.pos.distance(p) < radius * 2.0)
+                to_screen(ctx, p).and_then(|s| pick(ctx, s)).filter(|h| h.pos.distance(p) < radius * 2.0)
             },
             false,
         );
@@ -244,6 +253,9 @@ impl Stroke {
         // Frame: the normal, and an up direction from the camera or the stroke's path
         let normal = match settings.alignment {
             Alignment::Tangent => hit.nrm,
+            // A stamp on a surface the view cannot see faces the camera axis from that surface's
+            // side, or the rasterizer rejects its texels for facing away
+            Alignment::Camera if hidden && hit.nrm.dot(ctx.camera.forward()) > 0.0 => ctx.camera.forward(),
             Alignment::Camera => -ctx.camera.forward(),
         };
         let camera_up = {
@@ -340,6 +352,41 @@ mod tests {
         c.pitch = 0.0;
         c.frame(Vec3::splat(-1.0), Vec3::splat(1.0));
         (m, b, c)
+    }
+
+    /// A far-side surface point (stored on a surface the view cannot see) and its hit
+    fn far_side_hit(m: &Mesh, b: &Bvh, c: &OrbitCamera) -> SurfaceHit {
+        let far = c.forward().normalize();
+        nearest_surface(m, b, far, 0.1).unwrap()
+    }
+
+    /// After a hidden surface point, a distant screen sample resamples from where that point
+    /// projects, not from the viewport origin (which would paint across the model)
+    #[test]
+    fn a_screen_sample_after_a_hidden_point_resamples_from_where_it_projects() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let mut s = Stroke::new(&BrushSettings { size: 0.01, ..BrushSettings::default() }, &m);
+        assert!(!s.add_surface(&ctx, far_side_hit(&m, &b, &c), 1.0).is_empty());
+        // A visible point on the same screen row as the hidden point's projection
+        let stamps = s.add(&ctx, Vec2::new(300.0, 200.0), 1.0);
+        assert!(!stamps.is_empty(), "the visible point is painted");
+        assert!(stamps.iter().all(|st| st.center.y.abs() < 0.1), "every stamp stays on the row between the two points");
+    }
+
+    /// A camera-aligned stamp on a surface the view cannot see faces that surface's side
+    #[test]
+    fn a_hidden_camera_aligned_stamp_faces_its_surface() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let mut s = Stroke::new(&BrushSettings { alignment: Alignment::Camera, ..BrushSettings::default() }, &m);
+        let hit = far_side_hit(&m, &b, &c);
+        let stamps = s.add_surface(&ctx, hit, 1.0);
+        assert!(stamps.first().is_some_and(|st| st.normal.dot(hit.nrm) > 0.0), "the stamp faces the far-side surface");
+        // A visible camera-aligned stamp still faces the camera
+        let mut s = Stroke::new(&BrushSettings { alignment: Alignment::Camera, ..BrushSettings::default() }, &m);
+        let visible = s.add(&ctx, Vec2::new(200.0, 200.0), 1.0);
+        assert!(visible.first().is_some_and(|st| st.normal.dot(c.forward()) < 0.0), "a visible stamp faces the camera");
     }
 
     #[test]
