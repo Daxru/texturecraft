@@ -115,6 +115,11 @@ impl Stroke {
 
     /// Feed a pointer position (pixels) with pen pressure (1 for a mouse). Returns new stamps.
     pub fn add(&mut self, ctx: &PickCtx, screen: Vec2, pressure: f32) -> Vec<Stamp> {
+        if self.last.is_some_and(|last| !last.screen.is_finite()) {
+            // The last point (on a surface the view cannot see) has no screen position to
+            // continue from: start a new run here, before the lazy mouse holds this sample back
+            self.last = None;
+        }
         let mut p = screen;
         if self.settings.lazy > 0.0 {
             let l = *self.lazy.get_or_insert(screen);
@@ -181,11 +186,6 @@ impl Stroke {
             return;
         };
         let radius = self.radius_at(ctx, hit.pos, pressure);
-        if self.last.is_some_and(|last| !last.screen.is_finite()) {
-            // The last point (on a surface the view cannot see) has no screen position to
-            // resample from: start a new run here
-            self.last = None;
-        }
         if let Some(last) = self.last {
             let len = hit.pos.distance(last.pos);
             if len > 4.0 * radius && depth < 4 {
@@ -395,6 +395,18 @@ mod tests {
             "a stamp trails back across the center: {:?}",
             stamps.iter().map(|st| st.center).collect::<Vec<_>>()
         );
+    }
+
+    /// With the lazy mouse on, the first screen sample after a hidden point that does not project
+    /// (behind the camera) starts a new run and paints, instead of being held back
+    #[test]
+    fn a_screen_sample_after_a_point_behind_the_camera_starts_a_new_run() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let mut s = Stroke::new(&BrushSettings { lazy: 100.0, ..BrushSettings::default() }, &m);
+        let behind = SurfaceHit { pos: c.eye() - c.forward() * 1.0, ..far_side_hit(&m, &b, &c) };
+        s.add_surface(&ctx, behind, 1.0);
+        assert!(!s.add(&ctx, Vec2::new(200.0, 200.0), 1.0).is_empty(), "the visible sample paints");
     }
 
     /// A camera-aligned stamp on a surface the view cannot see faces that surface's side
