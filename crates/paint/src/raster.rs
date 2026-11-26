@@ -238,6 +238,9 @@ type TriTexels = (Vec<(u32, u32, f32)>, ([f32; 2], f32), bool);
 /// Two surface points count as the same one when their squared distance is within this
 /// fraction of twice the triangle's area (a distance of about a thousandth of its size).
 const SAME_POINT_AREA_FRACTION: f32 = 1e-6;
+/// Two shading normals count as the same when the cosine between them is at least this. Only
+/// then does the owner's scan accept and reject the texel exactly as this triangle's would.
+const SAME_NORMAL_COS: f32 = 0.9999;
 /// A texel-space triangle with less double area than this (texels squared) has no usable barycentrics.
 const MIN_UV_TRIANGLE_AREA: f32 = 1e-12;
 /// How far outside an edge a texel center may sit and still count as on it, as a share of the double area.
@@ -299,12 +302,18 @@ fn scan_triangle(
             } else if owner != NO_TRI && shared_uvs {
                 // The texel is owned by another triangle. When UVs overlap, this triangle can
                 // be another part mapped to the same UVs (mirrored or instanced): paint that
-                // part's surface point here too — unless it is the same surface point as the
-                // owner's (a plain edge two neighbours share), which the owner's own scan paints.
+                // part's surface point here too — unless the owner has the same surface point and
+                // normal (a plain edge two neighbours share), so its own scan paints it the same
+                // way. A coincident owner facing the other way (a double-sided card) rejects the
+                // texel for its normal, so this triangle still paints it.
                 let Some(bary) = uv_bary(uv_texels, [x as f32 + 0.5, y as f32 + 0.5]) else { continue };
                 let b0 = 1.0 - bary[0] - bary[1];
                 let point = *position_a * b0 + *position_b * bary[0] + *position_c * bary[1];
-                if owner_point(context, owner, texel).is_some_and(|q| q.distance_squared(point) <= same_point_tolerance2) {
+                let normal = (*normal_a * b0 + *normal_b * bary[0] + *normal_c * bary[1]).try_normalize();
+                let same_as_owner = owner_surface(context, owner, texel).is_some_and(|(q, n)| {
+                    q.distance_squared(point) <= same_point_tolerance2 && normal.zip(n).is_some_and(|(a, b)| a.dot(b) >= SAME_NORMAL_COS)
+                });
+                if same_as_owner {
                     continue;
                 }
                 via_other_owner = true;
@@ -364,12 +373,15 @@ fn scan_triangle(
     (center.1 < f32::MAX || !texels.is_empty()).then_some((texels, center, shared))
 }
 
-/// The surface point the G-buffer's owner triangle `owner` has at texel `texel`.
-fn owner_point(context: &RasterCtx, owner: u32, texel: usize) -> Option<Vec3> {
+/// The surface point and shading normal the G-buffer's owner triangle `owner` has at texel `texel`.
+fn owner_surface(context: &RasterCtx, owner: u32, texel: usize) -> Option<(Vec3, Option<Vec3>)> {
     let [a, b, c] = context.mesh.tri(owner as usize)?;
     let [b1, b2] = context.gbuf.bary.get(texel).copied()?;
     let b0 = 1.0 - b1 - b2;
-    Some(*context.mesh.positions.get(a)? * b0 + *context.mesh.positions.get(b)? * b1 + *context.mesh.positions.get(c)? * b2)
+    let (positions, normals) = (&context.mesh.positions, &context.mesh.normals);
+    let point = *positions.get(a)? * b0 + *positions.get(b)? * b1 + *positions.get(c)? * b2;
+    let normal = (*normals.get(a)? * b0 + *normals.get(b)? * b1 + *normals.get(c)? * b2).try_normalize();
+    Some((point, normal))
 }
 
 /// Barycentric weights (of vertices 1 and 2) of texel point `p` in the texel-space triangle
@@ -984,6 +996,59 @@ mod tests {
         let gbuf = UvGBuffer::new(&mesh, 0, 128, 128);
         assert!(gbuf.overlaps > 0, "the far-away triangle shares the first triangle's UVs");
         assert!(scan_all_triangles(&mesh, &bvh, &gbuf, 0.6) > 500, "the stamp covers a good part of the plane");
+    }
+
+    /// A double-sided card: a front quad and a coincident back quad facing the other way, with
+    /// the same UVs. Whichever of them owns the texels in the G-buffer, a stamp on the front
+    /// paints them (the back owner rejects them for its normal, so the front must not skip them).
+    #[test]
+    fn a_double_sided_card_is_paintable_whichever_side_owns_the_texels() {
+        let front = primitives::plane(2.0, 2);
+        let n = front.positions.len() as u32;
+        let back_indices: Vec<u32> = front.indices.chunks(3).flat_map(|t| [t[0], t[2], t[1]]).collect();
+        for back_first in [false, true] {
+            let (first, second): (Vec<u32>, Vec<u32>) = if back_first {
+                (back_indices.clone(), front.indices.iter().map(|i| i + n).collect())
+            } else {
+                (front.indices.clone(), back_indices.iter().map(|i| i + n).collect())
+            };
+            let (first_normal, second_normal) = if back_first { (Vec3::NEG_Y, Vec3::Y) } else { (Vec3::Y, Vec3::NEG_Y) };
+            let positions: Vec<Vec3> = front.positions.iter().chain(front.positions.iter()).copied().collect();
+            let normals: Vec<Vec3> = std::iter::repeat_n(first_normal, n as usize).chain(std::iter::repeat_n(second_normal, n as usize)).collect();
+            let uvs: Vec<Vec2> = front.uvs.iter().chain(front.uvs.iter()).copied().collect();
+            let indices: Vec<u32> = first.into_iter().chain(second).collect();
+            let mesh = Mesh::from_parts(positions, Some(normals), uvs, indices, "double-sided card").unwrap();
+            let bvh = Bvh::new(&mesh);
+            let gbuf = UvGBuffer::new(&mesh, 0, 128, 128);
+            assert!(gbuf.overlaps > 0, "both sides cover the same texels");
+
+            let stamp = Stamp {
+                center: Vec3::ZERO,
+                normal: Vec3::Y,
+                tangent: Vec3::X,
+                bitangent: Vec3::Z,
+                radius: 0.25,
+                flow: 1.0,
+                hardness: 0.9,
+                depth: 1.0,
+                seed: 0,
+                source: None,
+            };
+            let context = RasterCtx {
+                mesh: &mesh,
+                bvh: &bvh,
+                gbuf: &gbuf,
+                material: 0,
+                depth: None,
+                eye: Vec3::new(0.0, 5.0, 0.0),
+                backface_culling: true,
+                angle_fade: (70.0, 85.0),
+                shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            };
+            let mut canvas = StrokeCanvas::new(128, 128);
+            rasterize(&mut canvas, &context, &[stamp]);
+            assert!(from_u16(canvas.alpha.get(64, 64)[0]) > 0.99, "the front takes the stamp center (back listed first: {back_first})");
+        }
     }
 }
 
