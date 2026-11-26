@@ -65,6 +65,7 @@ mod project_recovery;
 mod rebuilt_uv_layout;
 mod resources_used;
 mod sample;
+mod shared_uv_parts;
 mod solo;
 mod swatches;
 mod symmetry;
