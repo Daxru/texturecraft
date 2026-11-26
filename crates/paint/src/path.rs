@@ -1,7 +1,10 @@
 //! Path tool geometry: a smooth curve through control points and the antialiased coverage of
-//! a closed curve (lasso fill). Works in any 2D space (screen pixels or texels).
+//! a closed curve (lasso fill). Works in any 2D space (screen pixels or texels), and the curve
+//! also in 3D (world units, along the surface).
 
-use texturecraft_geom::glam::Vec2;
+use std::ops::{Add, Mul, Sub};
+
+use texturecraft_geom::glam::{Vec2, Vec3};
 
 /// Most samples per curve segment.
 const MAX_SEGMENT_SAMPLES: f32 = 1024.0;
@@ -31,8 +34,35 @@ pub fn spline_segments_with_corners(points: &[Vec2], corners: &[bool], closed: b
     segment_samples(points, corners, closed, step).map(Iterator::collect).collect()
 }
 
+/// [`spline_segments_with_corners`] through points in 3D, sampled about every `step` world units
+pub fn spline_segments_3d_with_corners(points: &[Vec3], corners: &[bool], closed: bool, step: f32) -> Vec<Vec<Vec3>> {
+    segment_samples(points, corners, closed, step).map(Iterator::collect).collect()
+}
+
+/// A curve point in any space: 2D (screen pixels, texels) or 3D (world units)
+trait CurvePoint: Copy + Default + Add<Output = Self> + Sub<Output = Self> + Mul<f32, Output = Self> {
+    fn length(self) -> f32;
+}
+
+impl CurvePoint for Vec2 {
+    fn length(self) -> f32 {
+        self.length()
+    }
+}
+
+impl CurvePoint for Vec3 {
+    fn length(self) -> f32 {
+        self.length()
+    }
+}
+
 /// Stream samples so a flat curve does not allocate and retain every segment alongside its output
-fn segment_samples<'a>(points: &'a [Vec2], corners: &'a [bool], closed: bool, step: f32) -> impl Iterator<Item = impl Iterator<Item = Vec2> + 'a> + 'a {
+fn segment_samples<'a, P: CurvePoint>(
+    points: &'a [P],
+    corners: &'a [bool],
+    closed: bool,
+    step: f32,
+) -> impl Iterator<Item = impl Iterator<Item = P> + 'a> + 'a {
     let n = points.len();
     let wrap = move |i: isize| if closed { i.rem_euclid(n as isize) } else { i.clamp(0, n as isize - 1) };
     let at = move |i: isize| points.get(wrap(i) as usize).copied().unwrap_or_default();
@@ -55,7 +85,7 @@ fn segment_samples<'a>(points: &'a [Vec2], corners: &'a [bool], closed: bool, st
         (1..=k).map(move |j| {
             let t = j as f32 / k as f32;
             let (t2, t3) = (t * t, t * t * t);
-            0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
+            (p1 * 2.0 + (p2 - p0) * t + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2 + (p1 * 3.0 - p0 - p2 * 3.0 + p3) * t3) * 0.5
         })
     })
 }
