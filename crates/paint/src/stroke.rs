@@ -150,13 +150,19 @@ impl Stroke {
         // The lazy mouse follows the run too, so a later screen sample does not trail from
         // where the last visible sample left it
         self.lazy = hit.screen.is_finite().then_some(hit.screen);
-        self.advance(ctx, hit, radius, &mut out, |p| nearest_surface(ctx.mesh, ctx.bvh, p, radius * 2.0), true);
+        // Both ends of the step lie on the surface, so every point between them has a surface
+        // within half its length: reach that far, or a chord across a curved surface leaves
+        // its middle stamps off the surface
+        let reach = (radius * 2.0).max(self.last.map_or(0.0, |last| last.pos.distance(hit.pos) * 0.5) + radius);
+        self.advance(ctx, hit, radius, &mut out, |p| nearest_surface(ctx.mesh, ctx.bvh, p, reach), true);
         self.finish(ctx, out)
     }
 
     /// The next point starts a new run: the curve left the surface in between
     pub fn lift(&mut self) {
         self.last = None;
+        // The next run starts where its first sample is, not where the lazy mouse was left
+        self.lazy = None;
     }
 
     /// Particles and symmetry copies of new stamps, kept in the stroke
@@ -407,6 +413,35 @@ mod tests {
         let behind = SurfaceHit { pos: c.eye() - c.forward() * 1.0, ..far_side_hit(&m, &b, &c) };
         s.add_surface(&ctx, behind, 1.0);
         assert!(!s.add(&ctx, Vec2::new(200.0, 200.0), 1.0).is_empty(), "the visible sample paints");
+    }
+
+    /// Hidden stamps between two distant surface points stay on the curved surface, not on the
+    /// chord between them
+    #[test]
+    fn hidden_stamps_between_distant_points_stay_on_the_surface() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let mut s = Stroke::new(&BrushSettings { size: 0.003, ..BrushSettings::default() }, &m);
+        let on_sphere = |p: Vec3| nearest_surface(&m, &b, p.normalize(), 0.1).unwrap();
+        s.add_surface(&ctx, on_sphere(Vec3::new(0.3, 0.0, -1.0)), 1.0);
+        // A chord of about 0.6: its middle lies about 0.05 inside the unit sphere
+        let stamps = s.add_surface(&ctx, on_sphere(Vec3::new(-0.3, 0.0, -1.0)), 1.0);
+        assert!(stamps.len() > 10, "the run is stamped: {}", stamps.len());
+        assert!(stamps.iter().all(|st| (st.center.length() - 1.0).abs() < 0.01), "a stamp is off the surface");
+    }
+
+    /// After a lift (a gap in the curve), the next run starts at its own sample, not at the
+    /// lazy mouse position left by the previous run
+    #[test]
+    fn a_lift_resets_the_lazy_mouse() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let mut s = Stroke::new(&BrushSettings { lazy: 100.0, ..BrushSettings::default() }, &m);
+        s.add_surface(&ctx, far_side_hit(&m, &b, &c), 1.0);
+        s.lift();
+        let target = pick(&ctx, Vec2::new(250.0, 200.0)).unwrap().pos;
+        let stamps = s.add(&ctx, Vec2::new(250.0, 200.0), 1.0);
+        assert!(stamps.first().is_some_and(|st| st.center.distance(target) < 0.01), "the run starts at its sample");
     }
 
     /// A camera-aligned stamp on a surface the view cannot see faces that surface's side
