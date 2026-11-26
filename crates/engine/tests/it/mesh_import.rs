@@ -38,22 +38,28 @@ fn pbr_glb(images: [Option<Vec<u8>>; 5]) -> Vec<u8> {
     views.extend(image_views.iter().cloned());
 
     let (lo, hi) = mesh.bounds();
-    let slot = |i: usize| json!({ "index": i });
-    let mut pbr = json!({ "baseColorTexture": slot(0) });
-    let mut material = json!({ "name": "Rust", "pbrMetallicRoughness": pbr });
-    if images[1].is_some() {
-        pbr["metallicRoughnessTexture"] = slot(1);
-        material["pbrMetallicRoughness"] = pbr.clone();
+    // Each present image gets the next texture index; absent slots are left out
+    let mut index = 0;
+    let mut slot = |present: bool| {
+        present.then(|| {
+            index += 1;
+            json!({ "index": index - 1 })
+        })
+    };
+    let mut pbr = json!({});
+    let mut material = json!({ "name": "Rust" });
+    for (key, image, in_pbr) in [
+        ("baseColorTexture", &images[0], true),
+        ("metallicRoughnessTexture", &images[1], true),
+        ("normalTexture", &images[2], false),
+        ("occlusionTexture", &images[3], false),
+        ("emissiveTexture", &images[4], false),
+    ] {
+        if let Some(texture) = slot(image.is_some()) {
+            if in_pbr { pbr[key] = texture } else { material[key] = texture }
+        }
     }
-    if images[2].is_some() {
-        material["normalTexture"] = slot(2);
-    }
-    if images[3].is_some() {
-        material["occlusionTexture"] = slot(3);
-    }
-    if images[4].is_some() {
-        material["emissiveTexture"] = slot(4);
-    }
+    material["pbrMetallicRoughness"] = pbr;
 
     let n_images = images.iter().filter(|i| i.is_some()).count();
     let doc = json!({
@@ -167,6 +173,26 @@ fn glb_embedded_pbr_textures_become_a_fill_layer() {
     let mut reopened = reopened;
     let base = composite(&mut reopened, Channel::BaseColor);
     assert!(base.iter().zip(gray).any(|(v, g)| (v - g).abs() > 0.05), "still not gray after reopen: {base:?}");
+}
+
+/// With generated UVs the embedded textures would not line up, so they are not applied, and
+/// the log says why.
+#[test]
+fn glb_textures_are_not_applied_on_generated_uvs() {
+    let glb = pbr_glb([Some(png([200, 90, 40, 255])), None, None, None, None]);
+    let s = Session::from_mesh_bytes_with_uvs("rost.glb", &glb, 128, "rost", None, true).unwrap();
+    assert_eq!(s.doc.project.texture_set(0).unwrap().stack.len(), 1, "only the empty paint layer");
+    assert!(s.log.iter().any(|l| l.contains("were not applied")), "{:?}", s.log);
+}
+
+/// Absent slots leave gaps: a base color and a normal map alone still both arrive.
+#[test]
+fn glb_with_some_slots_missing_applies_the_present_ones() {
+    let glb = pbr_glb([Some(png([200, 90, 40, 255])), None, Some(png([128, 128, 255, 255])), None, None]);
+    let s = Session::from_mesh_bytes("rost.glb", &glb, 128, "rost").unwrap();
+    let (_, fill) = bottom_fill(&s, 0).expect("a fill layer");
+    assert!(matches!(fill.sources.get(&Channel::BaseColor), Some(Source::Image { .. })), "{:?}", fill.sources);
+    assert!(matches!(fill.sources.get(&Channel::Normal), Some(Source::Image { .. })), "{:?}", fill.sources);
 }
 
 #[test]

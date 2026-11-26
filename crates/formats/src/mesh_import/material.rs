@@ -104,12 +104,16 @@ impl MaterialTextures {
         }
         if let Some(b) = &self.occlusion_image {
             match decode(b) {
-                // Occlusion is the red channel of its texture.
-                Ok(img) => image(&mut out, Channel::AmbientOcclusion, channel_png(&img, 0, self.occlusion_strength)),
+                // Occlusion is the red channel of its texture, blended toward none (white) by its
+                // strength: glTF's 1 + strength * (red - 1)
+                Ok(img) => image(&mut out, Channel::AmbientOcclusion, occlusion_png(&img, self.occlusion_strength)),
                 Err(e) => out.warnings.push(format!("the occlusion texture of {name}: {e}")),
             }
         }
 
+        if self.emissive_image.is_some() && self.emissive.max_element() > 1.0 {
+            out.warnings.push(format!("the emissive strength of {name} is above 1: the emissive texture stores at most 1, so brighter texels are clipped"));
+        }
         match &self.emissive_image {
             Some(b) if self.emissive == Vec3::ONE => image(&mut out, Channel::Emissive, pass(b)),
             Some(b) => image(&mut out, Channel::Emissive, scaled_color(b, self.emissive.extend(1.0))),
@@ -130,18 +134,27 @@ fn decode(bytes: &[u8]) -> Result<crate::DecodedImage> {
     crate::decode_image_within(bytes, crate::MAX_RESOURCE_TEXELS)
 }
 
-/// One channel of `img` times `factor`, as a 16-bit gray PNG (glTF packs occlusion in red,
-/// roughness in green and metallic in blue).
+/// One channel of `img` times `factor`, as a 16-bit gray PNG (glTF packs roughness in green
+/// and metallic in blue).
 fn channel_png(img: &crate::DecodedImage, channel: usize, factor: f32) -> Result<(Vec<u8>, &'static str)> {
     let factor = if factor.is_finite() { factor.clamp(0.0, 1.0) } else { 1.0 };
     let values = img.rgba.iter().map(|p| p.get(channel).copied().unwrap_or(0.0) * factor);
     Ok((crate::gray16_png(img.width, img.height, values)?, "png"))
 }
 
+/// The occlusion (red channel) of `img` blended toward no occlusion by glTF's `strength`, as a
+/// 16-bit gray PNG: `1 + strength * (red - 1)`.
+fn occlusion_png(img: &crate::DecodedImage, strength: f32) -> Result<(Vec<u8>, &'static str)> {
+    let strength = if strength.is_finite() { strength.clamp(0.0, 1.0) } else { 1.0 };
+    let values = img.rgba.iter().map(|p| 1.0 + strength * (p.first().copied().unwrap_or(1.0) - 1.0));
+    Ok((crate::gray16_png(img.width, img.height, values)?, "png"))
+}
+
 /// An sRGB color texture times a linear `factor` (alpha times its alpha), as an RGBA8 PNG.
 fn scaled_color(bytes: &[u8], factor: Vec4) -> Result<(Vec<u8>, &'static str)> {
     let img = decode(bytes)?;
-    let f = factor.to_array().map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 1.0 });
+    // Not clamped to 1: an emissive strength scales the texture up (the stored texel still is)
+    let f = factor.to_array().map(|v| if v.is_finite() { v.max(0.0) } else { 1.0 });
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     let mut pixels = Vec::with_capacity(img.rgba.len());
     for p in &img.rgba {
@@ -169,9 +182,10 @@ fn scaled_normal(bytes: &[u8], scale: f32) -> Result<(Vec<u8>, &'static str)> {
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     let mut pixels = Vec::with_capacity(img.rgba.len());
     for p in &img.rgba {
-        // The stored value is n * 0.5 + 0.5; scale the deviation from the flat normal.
-        // The data map is read raw (no sRGB linearization): z and alpha pass through as stored.
-        pixels.push([byte(0.5 + (p[0] - 0.5) * s), byte(0.5 + (p[1] - 0.5) * s), byte(p[2]), byte(p[3])]);
+        // glTF: normalize((stored * 2 - 1) * (scale, scale, 1)), so the direction survives a
+        // scale above 1. The data map is read raw (no sRGB linearization); alpha passes through.
+        let n = Vec3::new((p[0] * 2.0 - 1.0) * s, (p[1] * 2.0 - 1.0) * s, p[2] * 2.0 - 1.0).try_normalize().unwrap_or(Vec3::Z);
+        pixels.push([byte(n.x * 0.5 + 0.5), byte(n.y * 0.5 + 0.5), byte(n.z * 0.5 + 0.5), byte(p[3])]);
     }
     Ok((crate::rgba8_png(img.width, img.height, &pixels)?, "png"))
 }

@@ -212,8 +212,18 @@ impl Session {
         session.doc.project.cameras = imported.cameras;
 
         session.log.warnings("Importer", imported.report.warnings);
-        for m in &imported.materials {
-            session.apply_material_textures(m);
+        if imported.report.uvs_generated {
+            // The embedded textures were made for the file's UVs, not the generated ones
+            for m in &imported.materials {
+                session.log.warn(
+                    "Importer",
+                    format!("the embedded textures of {} were not applied: the UVs were generated, so the textures would not line up", m.material),
+                );
+            }
+        } else {
+            for m in &imported.materials {
+                session.apply_material_textures(m);
+            }
         }
         session.sync_images();
         session.log.info(

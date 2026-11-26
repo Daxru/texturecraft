@@ -958,12 +958,63 @@ fn normal_scale_shrinks_xy_deviation_and_keeps_z_and_alpha() {
     let bytes = maps.images.iter().find(|(c, _, _)| *c == Channel::Normal).map(|(_, b, _)| b.clone()).expect("a normal map");
     let p = image::load_from_memory(&bytes).unwrap().into_rgba8().get_pixel(0, 0).0;
 
-    // z (blue) stays high, ~= the stored value, and alpha stays opaque.
-    assert!(p[2] >= 250 && p[3] == 255, "z and alpha must pass through, not be zeroed: {p:?}");
+    // z (blue) stays high (the normal still points out of the surface), and alpha stays opaque.
+    assert!(p[2] >= 230 && p[3] == 255, "z and alpha must be kept, not zeroed: {p:?}");
     // x and y move towards the flat normal 0.5: the deviation from 0.5 shrinks, keeping its sign.
     let dev = |v: u8| (f32::from(v) / 255.0 - 0.5).abs();
     assert!(dev(p[0]) < dev(200) && f32::from(p[0]) / 255.0 > 0.5, "x must shrink towards 0.5 from above: {p:?}");
     assert!(dev(p[1]) < dev(60) && f32::from(p[1]) / 255.0 < 0.5, "y must shrink towards 0.5 from below: {p:?}");
+}
+
+/// A normal scale above 1 tilts the normal further but keeps its direction (glTF normalizes
+/// after scaling), instead of clipping one component.
+#[test]
+fn normal_scale_above_one_keeps_the_direction() {
+    use texturecraft_core::Channel;
+
+    // About (0.8, 0, 0.6) packed; scale 2 gives (1.6, 0, 0.6), normalized about (0.94, 0, 0.35).
+    let m = MaterialTextures { material: "N".into(), normal_image: Some(png([230, 128, 204, 255])), normal_scale: 2.0, ..Default::default() };
+    let maps = m.maps();
+    let bytes = maps.images.iter().find(|(c, _, _)| *c == Channel::Normal).map(|(_, b, _)| b.clone()).expect("a normal map");
+    let p = image::load_from_memory(&bytes).unwrap().into_rgba8().get_pixel(0, 0).0;
+    let unpack = |v: u8| f32::from(v) / 255.0 * 2.0 - 1.0;
+    let (x, z) = (unpack(p[0]), unpack(p[2]));
+    let (x0, z0) = (unpack(230), unpack(204));
+    assert!(x / z > 2.0 * x0 / z0 * 0.9, "x/z doubles with the scale: {p:?}");
+    assert!(z < z0, "the scaled normal tilts away from straight out: {p:?}");
+}
+
+/// Occlusion strength blends toward no occlusion: 0 is white, 1 the texture's red.
+#[test]
+fn occlusion_strength_blends_toward_white() {
+    use texturecraft_core::Channel;
+
+    let gray = |strength: f32| {
+        let m = MaterialTextures { material: "O".into(), occlusion_image: Some(png([51, 0, 0, 255])), occlusion_strength: strength, ..Default::default() };
+        let bytes = m.maps().images.into_iter().find(|(c, _, _)| *c == Channel::AmbientOcclusion).map(|(_, b, _)| b).expect("an occlusion map");
+        f32::from(image::load_from_memory(&bytes).unwrap().into_luma16().get_pixel(0, 0).0[0]) / 65535.0
+    };
+    assert!(gray(0.0) > 0.99, "strength 0 is no occlusion");
+    assert!((gray(1.0) - 0.2).abs() < 0.01, "strength 1 is the red channel");
+    assert!(gray(0.5) > gray(1.0) && gray(0.5) < gray(0.0), "half strength lies in between");
+}
+
+/// An emissive strength above 1 brightens the texture instead of being clamped to 1, and the
+/// clipping above 1 is reported.
+#[test]
+fn emissive_strength_above_one_brightens_the_texture() {
+    use texturecraft_core::Channel;
+
+    let texel = |factor: f32| {
+        let m = MaterialTextures { material: "E".into(), emissive_image: Some(png([60, 60, 60, 255])), emissive: Vec3::splat(factor), ..Default::default() };
+        let maps = m.maps();
+        let bytes = maps.images.iter().find(|(c, _, _)| *c == Channel::Emissive).map(|(_, b, _)| b.clone()).expect("an emissive map");
+        (image::load_from_memory(&bytes).unwrap().into_rgba8().get_pixel(0, 0).0[0], maps.warnings)
+    };
+    let (dim, dim_warnings) = texel(0.5);
+    let (bright, bright_warnings) = texel(2.0);
+    assert!(bright > 60 && dim < 60, "strength 2 brightens, 0.5 dims: {dim} {bright}");
+    assert!(dim_warnings.is_empty() && bright_warnings.iter().any(|w| w.contains("above 1")), "{bright_warnings:?}");
 }
 
 #[test]

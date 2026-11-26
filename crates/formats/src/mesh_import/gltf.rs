@@ -254,6 +254,9 @@ fn pbr(raw: &mut RawMesh, scene: &craft_mesh::Scene, material: &craft_mesh::Mate
         emissive_image: read("emissive", material.emissive_texture),
         ..Default::default()
     };
+    if material.base_color_texture.is_some_and(|tex| tex.transform.is_some()) {
+        raw.warnings.push(format!("the base color texture of {name} uses a KHR_texture_transform, which is not applied"));
+    }
     if material.clearcoat_texture.is_some() || material.clearcoat_roughness_texture.is_some() {
         raw.warnings.push(format!("the clearcoat textures of {name} are not applied"));
     }
